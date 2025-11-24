@@ -167,6 +167,7 @@ const (
 	RPCDeleteProjects             = "WWINqb" // DeleteProjects
 	RPCMutateProject              = "s0tc2d" // MutateProject
 	RPCRemoveRecentlyViewed       = "fejl7e" // RemoveRecentlyViewedProject
+	RPCRegisterBinarySource       = "o4cbdc" // RegisterBinarySource (for file upload)
 
 	// NotebookLM service - Source operations
 	RPCAddSources           = "izAoDd" // AddSources
