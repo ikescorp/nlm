@@ -37,6 +37,7 @@ type AuthOptions struct {
 	Debug           bool
 	Help            bool
 	KeepOpenSeconds int
+	Stealth         bool
 }
 
 func parseAuthFlags(args []string) (*AuthOptions, []string, error) {
@@ -61,8 +62,9 @@ func parseAuthFlags(args []string) (*AuthOptions, []string, error) {
 	authFlags.BoolVar(&opts.Debug, "d", debug, "Enable debug output (shorthand)")
 	authFlags.BoolVar(&opts.Help, "help", false, "Show help for auth command")
 	authFlags.BoolVar(&opts.Help, "h", false, "Show help for auth command (shorthand)")
-	authFlags.IntVar(&opts.KeepOpenSeconds, "keep-open", 0, "Keep browser open for N seconds after successful auth")
 	authFlags.IntVar(&opts.KeepOpenSeconds, "k", 0, "Keep browser open for N seconds after successful auth (shorthand)")
+	authFlags.BoolVar(&opts.Stealth, "stealth", false, "Use stealth mode (manual browser login)")
+	authFlags.BoolVar(&opts.Stealth, "s", false, "Use stealth mode (shorthand)")
 
 	// Set custom usage
 	authFlags.Usage = func() {
@@ -222,6 +224,9 @@ func handleAuth(args []string, debug bool) (string, string, error) {
 
 	if opts.KeepOpenSeconds > 0 {
 		authOpts = append(authOpts, auth.WithKeepOpenSeconds(opts.KeepOpenSeconds))
+	}
+	if opts.Stealth {
+		authOpts = append(authOpts, auth.WithStealth())
 	}
 
 	// Get auth data

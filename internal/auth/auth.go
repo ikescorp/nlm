@@ -24,6 +24,7 @@ type BrowserAuth struct {
 	cancel          context.CancelFunc
 	useExec         bool
 	keepOpenSeconds int // Keep browser open for N seconds after auth
+	isStealth       bool // If true, skip delays and close immediately
 }
 
 func New(debug bool) *BrowserAuth {
@@ -41,6 +42,7 @@ type Options struct {
 	PreferredBrowsers []string
 	CheckNotebooks    bool
 	KeepOpenSeconds   int // Keep browser open for N seconds after auth
+	Stealth           bool
 }
 
 type Option func(*Options)
@@ -54,6 +56,7 @@ func WithPreferredBrowsers(browsers []string) Option {
 }
 func WithCheckNotebooks() Option             { return func(o *Options) { o.CheckNotebooks = true } }
 func WithKeepOpenSeconds(seconds int) Option { return func(o *Options) { o.KeepOpenSeconds = seconds } }
+func WithStealth() Option                    { return func(o *Options) { o.Stealth = true } }
 
 // tryMultipleProfiles attempts to authenticate using each profile until one succeeds
 func (ba *BrowserAuth) tryMultipleProfiles(targetURL string) (token, cookies string, err error) {
@@ -417,8 +420,11 @@ func (ba *BrowserAuth) GetAuth(opts ...Option) (token, cookies string, err error
 
 	// Store keep-open setting in the struct
 	ba.keepOpenSeconds = o.KeepOpenSeconds
+	ba.isStealth = o.Stealth
 
 	defer ba.cleanup()
+	var ctx context.Context
+	var cancel context.CancelFunc
 
 	// Extract domain from target URL for cookie checks
 	targetDomain := ""
@@ -615,26 +621,41 @@ func (ba *BrowserAuth) GetAuth(opts ...Option) (token, cookies string, err error
 		return "", "", fmt.Errorf("no valid profiles found")
 	}
 
-	// Create a temporary directory and copy profile data to preserve encryption keys
-	tempDir, err := os.MkdirTemp("", "nlm-chrome-*")
-	if err != nil {
-		return "", "", fmt.Errorf("create temp dir: %w", err)
-	}
-	ba.tempDir = tempDir
+	// Determine the user data directory to use
+	// When NLM_USE_ORIGINAL_PROFILE=1, use the original profile directory directly.
+	// This is useful for environments like WSL where cookie encryption keys are tied
+	// to the original profile location and copying them breaks authentication.
+	var userDataDir string
+	useOriginalProfile := os.Getenv("NLM_USE_ORIGINAL_PROFILE") == "1"
 
-	// Copy the profile data
-	if err := ba.copyProfileDataFromPath(selectedProfile.Path); err != nil {
-		return "", "", fmt.Errorf("copy profile: %w", err)
-	}
+	if useOriginalProfile {
+		// Use the parent directory of the profile path (e.g., ~/.config/google-chrome)
+		userDataDir = filepath.Dir(selectedProfile.Path)
+		if ba.debug {
+			fmt.Printf("Using original profile directory: %s\n", userDataDir)
+		}
+	} else {
+		// Default behavior: create a temporary directory and copy profile data
+		tempDir, err := os.MkdirTemp("", "nlm-chrome-*")
+		if err != nil {
+			return "", "", fmt.Errorf("create temp dir: %w", err)
+		}
+		ba.tempDir = tempDir
+		userDataDir = tempDir
 
-	var ctx context.Context
-	var cancel context.CancelFunc
+		// Skip profile copy in stealth mode for guest-like behavior
+		if !o.Stealth {
+			if err := ba.copyProfileDataFromPath(selectedProfile.Path); err != nil {
+				return "", "", fmt.Errorf("copy profile: %w", err)
+			}
+		}
+	}
 
 	// Use chromedp.ExecAllocator approach with minimal automation flags
 	chromeOpts := []chromedp.ExecAllocatorOption{
 		chromedp.NoFirstRun,
 		chromedp.NoDefaultBrowserCheck,
-		chromedp.UserDataDir(ba.tempDir),
+		chromedp.UserDataDir(userDataDir),
 		chromedp.Flag("headless", !ba.debug),
 		chromedp.Flag("window-size", "1280,800"),
 		chromedp.Flag("new-window", true),
@@ -644,6 +665,14 @@ func (ba *BrowserAuth) GetAuth(opts ...Option) (token, cookies string, err error
 
 		// Use the appropriate browser executable for this profile type
 		chromedp.ExecPath(getBrowserPathForProfile(selectedProfile.Browser)),
+	}
+
+	// If using original profile, add the specific profile directory flag
+	if useOriginalProfile {
+		profileName := filepath.Base(selectedProfile.Path)
+		if profileName != "Default" {
+			chromeOpts = append(chromeOpts, chromedp.Flag("profile-directory", profileName))
+		}
 	}
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), chromeOpts...)
@@ -811,7 +840,7 @@ func findMostRecentProfile(profilePath string) string {
 	return mostRecent
 }
 
-func (ba *BrowserAuth) startChromeExec() (string, error) {
+func (ba *BrowserAuth) startChromeExec(targetURL string) (string, error) {
 	debugPort := "9222"
 	debugURL := fmt.Sprintf("http://localhost:%s", debugPort)
 
@@ -825,7 +854,7 @@ func (ba *BrowserAuth) startChromeExec() (string, error) {
 		fmt.Printf("Using profile: %s\n", ba.tempDir)
 	}
 
-	ba.chromeCmd = exec.Command(chromePath,
+	args := []string{
 		fmt.Sprintf("--remote-debugging-port=%s", debugPort),
 		fmt.Sprintf("--user-data-dir=%s", ba.tempDir),
 		"--no-first-run",
@@ -833,7 +862,12 @@ func (ba *BrowserAuth) startChromeExec() (string, error) {
 		"--disable-extensions",
 		"--disable-sync",
 		"--window-size=1280,800",
-	)
+	}
+	if targetURL != "" {
+		args = append(args, targetURL)
+	}
+
+	ba.chromeCmd = exec.Command(chromePath, args...)
 
 	if ba.debug {
 		ba.chromeCmd.Stdout = os.Stdout
@@ -881,6 +915,13 @@ func (ba *BrowserAuth) cleanup() {
 	if ba.cancel != nil {
 		ba.cancel()
 	}
+
+	// Keep browser open if requested, but only in non-stealth mode
+	if !ba.isStealth && ba.keepOpenSeconds > 0 {
+		fmt.Printf("\nKeeping browser open for %d seconds...\n", ba.keepOpenSeconds)
+		time.Sleep(time.Duration(ba.keepOpenSeconds) * time.Second)
+	}
+
 	if ba.chromeCmd != nil && ba.chromeCmd.Process != nil {
 		ba.chromeCmd.Process.Kill()
 	}
@@ -1028,7 +1069,8 @@ func (ba *BrowserAuth) extractAuthDataForURL(ctx context.Context, targetURL stri
 	}
 
 	// If keep-open is set, give user time to manually authenticate BEFORE checking
-	if ba.keepOpenSeconds > 0 {
+	// Skip this in stealth mode as the user has a manual pause already
+	if !ba.isStealth && ba.keepOpenSeconds > 0 {
 		fmt.Printf("\n⏳ Browser opened. You have %d seconds to manually log in if needed...\n", ba.keepOpenSeconds)
 		fmt.Printf("  If already logged in, just wait for automatic authentication.\n\n")
 		time.Sleep(time.Duration(ba.keepOpenSeconds) * time.Second)
@@ -1196,7 +1238,7 @@ func (ba *BrowserAuth) tryExtractAuth(ctx context.Context) (token, cookies strin
 	err = chromedp.Run(ctx,
 		chromedp.Evaluate(`WIZ_global_data.SNlM0e`, &token),
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			cks, err := network.GetCookies().WithUrls([]string{"https://notebooklm.google.com"}).Do(ctx)
+			cks, err := network.GetCookies().WithURLs([]string{"https://notebooklm.google.com"}).Do(ctx)
 			if err != nil {
 				return fmt.Errorf("get cookies: %w", err)
 			}
